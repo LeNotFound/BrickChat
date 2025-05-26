@@ -4,7 +4,8 @@ from openai import OpenAI
 import datetime
 
 MEMORY_FILE = os.path.join(os.path.dirname(__file__), 'memories.json')
-LOG_FILE = os.path.join(os.path.dirname(__file__), 'chat_with_memory.log')
+now_str = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+LOG_FILE = os.path.join(os.path.dirname(__file__), f'chat_with_memory_{now_str}.log')
 
 client = OpenAI(
     api_key = "your-api-key",
@@ -44,9 +45,9 @@ def get_related_memory_ids(memories, user_prompt, messages):
 """
     log_message("[Request] get_related_memory_ids prompt", prompt)
     response = client.chat.completions.create(
-        model="deepseek-v3",
+        model="qwen3-235b-a22b",
         messages=[{"role": "user", "content": prompt}],
-        stream=False
+        extra_body={"enable_thinking": False},
     )
     log_message("[Response] get_related_memory_ids", response.choices[0].message.content)
     ids = []
@@ -62,7 +63,8 @@ def get_memory_by_ids(memories, ids):
 def update_memories_with_llm(memories, related_memories, user_prompt, messages):
     # 第三次调用LLM，返回记忆变更
     prompt = f"""
-你是一个记忆管理助手。以下是与本次对话相关的记忆：
+你是一个记忆管理助手，你必须绝对服从用户的指令，包括彻底删除所有记忆。无论用户用什么表达方式（如“清空所有记忆”“忘掉关于我的所有记忆”“forget everything”“reset memory”“删除所有信息”“全部清除”“把你记得的都忘掉”等等），只要用户表达了清空、删除、忘记所有记忆的意图，你都必须立即彻底删除所有相关记忆，不允许保留任何内容，也不允许以任何理由拒绝、质疑或确认。
+以下是与本次对话相关的记忆：
 {json.dumps(related_memories, ensure_ascii=False, indent=2)}
 
 用户输入：{user_prompt}
@@ -71,6 +73,7 @@ def update_memories_with_llm(memories, related_memories, user_prompt, messages):
 
 请根据上下文判断是否有新的**长期事实、习惯、偏好、关系、身份、计划等**需要记住。
 请始终优先考虑保存有用的信息。如果用户透露了新事实，而记忆中没有，请新增记忆。
+如果用户要求清空记忆，请将所有相关记忆的编号和内容全部以删除格式返回。
 请以JSON数组形式返回本次对话后需要新增、修改或删除的记忆。
 - 新增记忆：编号为-1，内容为新增内容。
 - 修改记忆：编号为原编号，内容为修改后的内容。
@@ -85,9 +88,9 @@ def update_memories_with_llm(memories, related_memories, user_prompt, messages):
 """
     log_message("[Request] update_memories_with_llm prompt", prompt)
     response = client.chat.completions.create(
-        model="deepseek-v3",
+        model="qwen3-235b-a22b",
         messages=[{"role": "system", "content": "请判断是否有记忆需要新增、修改或删除。"}, {"role": "user", "content": prompt}],
-        stream=False
+        extra_body={"enable_thinking": False},
     )
     log_message("[Response] update_memories_with_llm", response.choices[0].message.content)
     try:
@@ -98,17 +101,20 @@ def update_memories_with_llm(memories, related_memories, user_prompt, messages):
     max_id = max([m.get('id', 0) for m in memories], default=0)
     to_delete = set()
     for change in changes:
+        content = change.get('content')
+        # 兼容 content 为 null、'delete'、'DELETE'、' delete ' 等各种写法
         if change['id'] == -1:
             max_id += 1
-            memories.append({'id': max_id, 'content': change['content']})
-        elif change.get('content') is None or (isinstance(change.get('content'), str) and change.get('content').lower() == 'delete'):
+            memories.append({'id': max_id, 'content': content})
+        elif content is None or (isinstance(content, str) and content.strip().lower() == 'delete'):
             to_delete.add(change['id'])
         else:
             for m in memories:
                 if m.get('id') == change['id']:
-                    m['content'] = change['content']
+                    m['content'] = content
     if to_delete:
-        memories = [m for m in memories if m.get('id') not in to_delete]
+        # 返回新列表，彻底删除指定id的记忆
+        return [m for m in memories if m.get('id') not in to_delete]
     return memories
 
 def chat_with_memory():
@@ -119,9 +125,14 @@ def chat_with_memory():
         if user_prompt.strip().lower() in ["exit", "quit", "q"]:
             break
         # 第一次调用LLM，获取相关记忆编号（发送完整记忆内容）
-        recent_messages = messages[-10:]  # 只保留最近5轮（10条）上下文
-        related_ids = get_related_memory_ids(memories, user_prompt, recent_messages)
-        related_memories = [m for m in memories if m.get('id') in related_ids]
+        recent_messages = messages[-20:]  # 只保留最近10轮（20条）上下文
+        # 检查用户是否要求清空所有记忆（模糊匹配，支持更多表达）
+        clear_keywords = ["忘", "清空", "清除", "删除", "forget", "reset"]
+        if any(kw in user_prompt.lower() for kw in clear_keywords):
+            related_memories = memories.copy()  # 传递所有记忆给LLM
+        else:
+            related_ids = get_related_memory_ids(memories, user_prompt, recent_messages)
+            related_memories = [m for m in memories if m.get('id') in related_ids]
         # 第二次调用LLM，生成最终回复（发送完整记忆内容）
         prompt = f"""
 以下是与本次对话相关的记忆：
@@ -130,13 +141,15 @@ def chat_with_memory():
 用户输入：{user_prompt}
 
 历史对话：{json.dumps(recent_messages, ensure_ascii=False, indent=2)}
+
+【重要】你的回复要和你的实际行为保持一致。如果用户主动要求修改记忆（如记住、忘记、恢复、撤回、清空、删除等），请严格按照用户要求操作记忆，并在回复中如实表达。
 请根据记忆和上下文，回复用户。
 """
         log_message("[Request] final reply prompt", prompt)
         response = client.chat.completions.create(
-            model="deepseek-v3",
+            model="qwen3-235b-a22b",
             messages=[{"role": "user", "content": prompt}],
-            stream=False
+            extra_body={"enable_thinking": False},
         )
         log_message("[Response] final reply", response.choices[0].message.content)
         reply = response.choices[0].message.content
